@@ -28,7 +28,7 @@ init_db()
 # ==========================================
 def send_email(receiver, subject, body):
     sender_email = '발신자이메일@gmail.com'  # 본인 이메일
-    password = '16자리'        # 앱 비밀번호
+    password = '비밀번호16자리'        # 앱 비밀번호
     
     msg = MIMEMultipart()
     msg['From'] = sender_email
