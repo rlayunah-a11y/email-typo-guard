@@ -142,7 +142,6 @@ def process_email(receiver, subject, body):
         my_email = '발신자이메일@gmail.com' 
         alert_subject = f"[경고] 작성 중인 메일에서 {error_count}개의 오타가 감지되었습니다."
         
-        # 요청하신 대로 3번(원문) 삭제, 숫자는 빼고, 조건에 따라 하나만 표시
         alert_body = f"""
 [시스템 알림: 오타 감지 보고서]
 작성하신 이메일 발송이 일시 중단되었습니다. 아래 교정 제안을 확인해주세요.
