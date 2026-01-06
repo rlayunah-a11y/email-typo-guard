@@ -8,7 +8,7 @@ from datetime import datetime
 from hanspell import spell_checker
 
 # ==========================================
-# 1. DB 설정 (기존 데이터 유지)
+# 1. DB 설정
 # ==========================================
 DB_NAME = "mail_data.db"
 
@@ -27,15 +27,9 @@ init_db()
 # 2. 이메일 발송 함수
 # ==========================================
 def send_email(receiver, subject, body):
+    sender_email = '발신자이메일@gmail.com'  # 본인 이메일
+    password = '16자리'        # 앱 비밀번호
     
-    # --------------------------------------------------------
-    # 발신자 정보 입력
-    # --------------------------------------------------------
-    sender_email = 'nextpaigeis@gmail.com'  # 본인 이메일 (발신자)
-    password = 'vcru fdkh ozul pugy'         # 앱 비밀번호
-    # --------------------------------------------------------
-    
-    # MIME 객체 생성
     msg = MIMEMultipart()
     msg['From'] = sender_email
     msg['To'] = receiver
@@ -43,25 +37,18 @@ def send_email(receiver, subject, body):
     msg.attach(MIMEText(body, 'plain'))
 
     try:
-        # Gmail SMTP 서버에 연결하고 이메일 보내기
         server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()          # TLS 보안 연결
-        server.login(sender_email, password)  # 로그인
-
-        # 이메일 발송
-        text = msg.as_string()
-        server.sendmail(sender_email, receiver, text)
-
-        # 서버 연결 종료
+        server.starttls()
+        server.login(sender_email, password)
+        server.sendmail(sender_email, receiver, msg.as_string())
         server.quit()
         return True
-        
     except Exception as e:
         print(f"전송 에러: {e}")
         return False
 
 # ==========================================
-# 3. [안전장치] 내부 오타 검사
+# 3. 내부 오타 검사
 # ==========================================
 def local_fallback_check(text):
     """네이버 연결 실패 시 사용하는 비상용 사전"""
@@ -73,29 +60,57 @@ def local_fallback_check(text):
         "되요": "돼요",
         "로써": "로서"
     }
-    found_typos = []
-    for wrong in typo_dictionary:
+    found_details = []
+    
+    for wrong, right in typo_dictionary.items():
         if wrong in text:
-            found_typos.append(wrong)
-    return len(found_typos), found_typos
+            found_details.append(f"'{wrong}' → '{right}'")
+            
+    return len(found_details), found_details
 
 # ==========================================
-# 4. 메인 로직 (수정됨: 보고서 삭제, 오타 알림 추가)
+# 4. 메인 로직
 # ==========================================
 def process_email(receiver, subject, body):
     
     is_naver = False
     
-    # 1. 맞춤법 검사 (네이버 시도 -> 실패시 내부사전)
+    # 메일에 들어갈 핵심 내용 변수
+    mail_content_header = ""
+    mail_content_body = ""
+
+    # 1. 맞춤법 검사 로직
     try:
+        # [A] 네이버 검사 시도
         spelled = spell_checker.check(body)
         error_count = spelled.errors
-        typo_list = [key for key, _ in spelled.words.items() if _ == 2]
+        
+        # 네이버인 경우: 전체 교정 문장(2번 내용)을 준비
+        full_corrected_text = spelled.checked 
+        
+        # DB 저장용 오타 목록
+        typo_list = [key for key, _ in spelled.words.items() if _ >= 1]
         typos_str = ", ".join(typo_list)
+        
+        # 메일 본문 내용 설정 (네이버용)
+        mail_content_header = "📝 전체 문장 교정 제안"
+        mail_content_body = full_corrected_text
+            
         is_naver = True
+        
     except:
-        error_count, typo_list = local_fallback_check(body)
-        typos_str = ", ".join(typo_list)
+        # [B] 실패 시 내부 사전 사용
+        error_count, typo_details = local_fallback_check(body)
+        
+        # DB 저장용 오타 목록
+        typos_str = ", ".join(typo_details)
+        
+        # 메일 본문 내용 설정 (내부 사전용 -> 1번 내용)
+        correction_guide = "\n".join([f"- {item}" for item in typo_details])
+        
+        mail_content_header = "💡 교정 가이드 (수정 제안)"
+        mail_content_body = correction_guide
+        
         is_naver = False
 
     # 2. DB 저장
@@ -107,40 +122,37 @@ def process_email(receiver, subject, body):
     conn.commit()
     conn.close()
 
-    # 3. 결과 분기
+    # 3. 결과 분기 및 메일 발송
     if error_count == 0:
-        # 오타 없는 경우 -> 정상 발송 시도
         if send_email(receiver, subject, body):
             msg = "✅ 발송 성공!"
             if not is_naver: msg += " (백업 시스템 동작)"
             gr.Info(msg)
             return last_id, gr.update(visible=False)
         else:
-            gr.Warning("❌ 발송 실패: 아이디/비밀번호를 확인하세요.")
+            gr.Warning("❌ 발송 실패: 계정 정보를 확인하세요.")
             return last_id, gr.update(visible=False)
     else:
         # ------------------------------------------------------------
-        # 오타 있는 경우 -> 경고창 + 내 메일로 알림 발송
+        # 오타 발견 -> 알림 메일 발송 (조건부 내용 적용)
         # ------------------------------------------------------------
-        msg = f"🚫 오타 {error_count}개 발견! 발송 중단.\n[목록] {typos_str}"
-        gr.Warning(msg)
+        msg_ui = f"🚫 오타 {error_count}개 발견! 발송이 차단되었습니다."
+        gr.Warning(msg_ui)
         
-        # 알림 메일 내용 구성
-        my_email = 'nextpaigeis@gmail.com' # [주의] 위 send_email 함수에 적은 본인 이메일과 동일하게 적어주세요
-        alert_subject = f"[경고] 작성 중인 메일에서 오타가 감지되었습니다."
+        my_email = '발신자이메일@gmail.com' 
+        alert_subject = f"[경고] 작성 중인 메일에서 {error_count}개의 오타가 감지되었습니다."
+        
+        # 요청하신 대로 3번(원문) 삭제, 숫자는 빼고, 조건에 따라 하나만 표시
         alert_body = f"""
-[시스템 알림]
-작성하신 메일에서 오타가 발견되어 발송이 차단되었습니다.
+[시스템 알림: 오타 감지 보고서]
+작성하신 이메일 발송이 일시 중단되었습니다. 아래 교정 제안을 확인해주세요.
 
-- 발견된 오타 목록: {typos_str}
-- 오타 개수: {error_count}개
-
---------------------------------------------------
-[작성 원문]
-{body}
---------------------------------------------------
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{mail_content_header}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{mail_content_body}
 """
-        # 발신자에게 알림 발송
+        # 나에게 알림 보내기
         send_email(my_email, alert_subject, alert_body)
         
         return last_id, gr.update(visible=True)
@@ -168,7 +180,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         with gr.Column(scale=2):
             receiver_input = gr.Textbox(label="수신자 이메일")
             subject_input = gr.Textbox(label="제목")
-            content_input = gr.TextArea(label="본문 내용", lines=10)
+            content_input = gr.TextArea(label="본문 내용", lines=10, placeholder="내용을 입력하세요.")
             send_btn = gr.Button("메일 보내기", variant="primary")
         
         with gr.Column(scale=1):
