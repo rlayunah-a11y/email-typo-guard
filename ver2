@@ -1,0 +1,185 @@
+import gradio as gr
+import smtplib
+import sqlite3
+import pandas as pd
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import datetime
+from hanspell import spell_checker
+
+# ==========================================
+# 1. DB 설정 (기존 데이터 유지)
+# ==========================================
+DB_NAME = "mail_data.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS mail_logs 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  body TEXT, typos TEXT, is_correct_feedback INTEGER, timestamp TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ==========================================
+# 2. 이메일 발송 함수
+# ==========================================
+def send_email(receiver, subject, body):
+    
+    # --------------------------------------------------------
+    # 발신자 정보 입력
+    # --------------------------------------------------------
+    sender_email = 'nextpaigeis@gmail.com'  # 본인 이메일 (발신자)
+    password = 'vcru fdkh ozul pugy'         # 앱 비밀번호
+    # --------------------------------------------------------
+    
+    # MIME 객체 생성
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = receiver
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        # Gmail SMTP 서버에 연결하고 이메일 보내기
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()          # TLS 보안 연결
+        server.login(sender_email, password)  # 로그인
+
+        # 이메일 발송
+        text = msg.as_string()
+        server.sendmail(sender_email, receiver, text)
+
+        # 서버 연결 종료
+        server.quit()
+        return True
+        
+    except Exception as e:
+        print(f"전송 에러: {e}")
+        return False
+
+# ==========================================
+# 3. [안전장치] 내부 오타 검사
+# ==========================================
+def local_fallback_check(text):
+    """네이버 연결 실패 시 사용하는 비상용 사전"""
+    typo_dictionary = {
+        "역활": "역할",
+        "봽겠습니다": "뵙겠습니다",
+        "결제": "결재",
+        "어떻해": "어떡해",
+        "되요": "돼요",
+        "로써": "로서"
+    }
+    found_typos = []
+    for wrong in typo_dictionary:
+        if wrong in text:
+            found_typos.append(wrong)
+    return len(found_typos), found_typos
+
+# ==========================================
+# 4. 메인 로직 (수정됨: 보고서 삭제, 오타 알림 추가)
+# ==========================================
+def process_email(receiver, subject, body):
+    
+    is_naver = False
+    
+    # 1. 맞춤법 검사 (네이버 시도 -> 실패시 내부사전)
+    try:
+        spelled = spell_checker.check(body)
+        error_count = spelled.errors
+        typo_list = [key for key, _ in spelled.words.items() if _ == 2]
+        typos_str = ", ".join(typo_list)
+        is_naver = True
+    except:
+        error_count, typo_list = local_fallback_check(body)
+        typos_str = ", ".join(typo_list)
+        is_naver = False
+
+    # 2. DB 저장
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO mail_logs (body, typos, is_correct_feedback, timestamp) VALUES (?, ?, ?, ?)",
+              (body, typos_str, 0, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    last_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    # 3. 결과 분기
+    if error_count == 0:
+        # 오타 없는 경우 -> 정상 발송 시도
+        if send_email(receiver, subject, body):
+            msg = "✅ 발송 성공!"
+            if not is_naver: msg += " (백업 시스템 동작)"
+            gr.Info(msg)
+            return last_id, gr.update(visible=False)
+        else:
+            gr.Warning("❌ 발송 실패: 아이디/비밀번호를 확인하세요.")
+            return last_id, gr.update(visible=False)
+    else:
+        # ------------------------------------------------------------
+        # 오타 있는 경우 -> 경고창 + 내 메일로 알림 발송
+        # ------------------------------------------------------------
+        msg = f"🚫 오타 {error_count}개 발견! 발송 중단.\n[목록] {typos_str}"
+        gr.Warning(msg)
+        
+        # 알림 메일 내용 구성
+        my_email = 'nextpaigeis@gmail.com' # [주의] 위 send_email 함수에 적은 본인 이메일과 동일하게 적어주세요
+        alert_subject = f"[경고] 작성 중인 메일에서 오타가 감지되었습니다."
+        alert_body = f"""
+[시스템 알림]
+작성하신 메일에서 오타가 발견되어 발송이 차단되었습니다.
+
+- 발견된 오타 목록: {typos_str}
+- 오타 개수: {error_count}개
+
+--------------------------------------------------
+[작성 원문]
+{body}
+--------------------------------------------------
+"""
+        # 발신자에게 알림 발송
+        send_email(my_email, alert_subject, alert_body)
+        
+        return last_id, gr.update(visible=True)
+
+# ==========================================
+# 5. 피드백 함수
+# ==========================================
+def submit_feedback(row_id, feedback_val):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    val = 1 if feedback_val == "네, 오타가 맞습니다" else 0
+    c.execute("UPDATE mail_logs SET is_correct_feedback = ? WHERE id = ?", (val, row_id))
+    conn.commit()
+    conn.close()
+    gr.Info("피드백 반영 완료!")
+    return "반영 완료"
+
+# ==========================================
+# 6. UI 구성
+# ==========================================
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("## 📧 스마트 메일 시스템")
+    
+    with gr.Row():
+        with gr.Column(scale=2):
+            receiver_input = gr.Textbox(label="수신자 이메일")
+            subject_input = gr.Textbox(label="제목")
+            content_input = gr.TextArea(label="본문 내용", lines=10)
+            send_btn = gr.Button("메일 보내기", variant="primary")
+        
+        with gr.Column(scale=1):
+            current_log_id = gr.State()
+            with gr.Group(visible=False) as feedback_area:
+                gr.Markdown("### 🧐 결과 검증")
+                feedback_radio = gr.Radio(["네, 오타가 맞습니다", "아니요"], label="판단")
+                feedback_btn = gr.Button("제출")
+                feedback_msg = gr.Markdown("")
+
+    send_btn.click(fn=process_email, inputs=[receiver_input, subject_input, content_input], outputs=[current_log_id, feedback_area])
+    feedback_btn.click(fn=submit_feedback, inputs=[current_log_id, feedback_radio], outputs=feedback_msg)
+
+demo.launch()
