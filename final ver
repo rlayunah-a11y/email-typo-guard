@@ -1,0 +1,394 @@
+import os
+import sqlite3
+import smtplib
+import pandas as pd
+import gradio as gr
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from collections import Counter
+from io import BytesIO
+from datetime import datetime
+
+# 이메일 관련 라이브러리
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+
+# -----------------------------------------------------------------------------
+# 1. 환경 설정 및 라이브러리 설치 (한글 폰트 & Hanspell)
+# -----------------------------------------------------------------------------
+# 폰트 파일 경로 정의 (Colab 설치 기준)
+FONT_PATH = '/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf'
+
+def setup_environment():
+    # Hanspell 설치
+    try:
+        from hanspell import spell_checker
+    except ImportError:
+        print("⏳ Hanspell 라이브러리 설치 중...")
+        os.system("pip install git+https://github.com/ssut/py-hanspell.git")
+    
+    # 한글 폰트 설치 (Colab용)
+    if not os.path.exists(FONT_PATH):
+        print("⏳ 한글 폰트(나눔바른고딕) 설치 및 캐시 초기화 중...")
+        os.system("sudo apt-get install -y fonts-nanum")
+        os.system("sudo fc-cache -fv")
+        os.system("rm ~/.cache/matplotlib -rf")
+        print("✅ 폰트 설치 완료")
+
+setup_environment()
+from hanspell import spell_checker
+
+# -----------------------------------------------------------------------------
+# 2. 상수 및 설정 정의
+# -----------------------------------------------------------------------------
+DB_NAME = "mail_data.db"
+CSV_FILE_PATH = "business_email_errors_augmented_300.csv"  # 분석 대상 파일
+SENDER_EMAIL = '발신자이메일@gmail.com'
+APP_PASSWORD = '16자리리'  # 본인의 앱 비밀번호 확인 필요
+
+# -----------------------------------------------------------------------------
+# 3. 데이터 유틸리티 (CSV 분석 & DB)
+# -----------------------------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS mail_logs 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  body TEXT, typos TEXT, is_correct_feedback INTEGER, timestamp TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_data_analysis():
+    """
+    CSV 파일을 읽어 두 가지 데이터를 반환합니다.
+    1. recent_stats: 최근 20건에 대한 Top 5 (리스트/표 용도)
+    2. cumulative_stats: 전체 누적 데이터에 대한 Top 5 (그래프 용도)
+    """
+    default_result = ([], []) # (top_spans, top_types)
+
+    if not os.path.exists(CSV_FILE_PATH):
+        return default_result, default_result
+
+    try:
+        # 파일 읽기
+        try:
+            df = pd.read_csv(CSV_FILE_PATH, encoding='utf-8')
+        except:
+            df = pd.read_csv(CSV_FILE_PATH, encoding='cp949')
+            
+        if df.empty:
+            return default_result, default_result
+
+        # --- 최근 20건 분석 (리스트) ---
+        recent_df = df.tail(20)
+        
+        # 단어
+        if 'span' in recent_df.columns:
+            recent_span_counts = Counter(recent_df['span'].dropna().astype(str))
+            recent_top_spans = recent_span_counts.most_common(5)
+        else:
+            recent_top_spans = []
+
+        # 에러 유형
+        if 'error_type' in recent_df.columns:
+            recent_type_counts = Counter(recent_df['error_type'].dropna().astype(str))
+            recent_top_types = recent_type_counts.most_common(5)
+        else:
+            recent_top_types = []
+
+        recent_stats = (recent_top_spans, recent_top_types)
+
+
+        # --- 전체 누적 분석 (그래프) ---
+        # 전체 df 사용
+        
+        # 단어
+        if 'span' in df.columns:
+            cum_span_counts = Counter(df['span'].dropna().astype(str))
+            cum_top_spans = cum_span_counts.most_common(5)
+        else:
+            cum_top_spans = []
+
+        # 에러 유형
+        if 'error_type' in df.columns:
+            cum_type_counts = Counter(df['error_type'].dropna().astype(str))
+            cum_top_types = cum_type_counts.most_common(5)
+        else:
+            cum_top_types = []
+
+        cumulative_stats = (cum_top_spans, cum_top_types)
+
+        return recent_stats, cumulative_stats
+
+    except Exception as e:
+        print(f"CSV 분석 에러: {e}")
+        return default_result, default_result
+
+# -----------------------------------------------------------------------------
+# 4. 그래프 생성 (누적 데이터 사용 + 한글 폰트 적용)
+# -----------------------------------------------------------------------------
+def make_bar_png(items, title, color='#6c5ce7'):
+    """
+    (라벨, 값) 리스트를 받아 막대그래프 PNG 바이너리를 반환합니다.
+    """
+    if not items:
+        items = [("데이터 없음", 0)]
+
+    # 폰트 속성 설정
+    try:
+        font_prop = fm.FontProperties(fname=FONT_PATH)
+    except:
+        font_prop = fm.FontProperties(family='sans-serif')
+
+    labels = [str(k) for k, v in items]
+    values = [v for k, v in items]
+
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+    bars = ax.bar(labels, values, color=color, alpha=0.8)
+    
+    # 값 표시 (폰트 적용)
+    for bar in bars:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2.0, height, f'{int(height)}', 
+                ha='center', va='bottom', fontproperties=font_prop)
+
+    # 제목 및 축 라벨 (폰트 적용)
+    ax.set_title(title, fontsize=12, fontweight='bold', fontproperties=font_prop)
+    ax.set_ylabel("발생 횟수", fontproperties=font_prop)
+    plt.xticks(rotation=15, fontproperties=font_prop)
+    plt.yticks(fontproperties=font_prop)
+    
+    plt.tight_layout()
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+# -----------------------------------------------------------------------------
+# 5. HTML 이메일 포맷팅 (리스트=최근20건 / 그래프=누적)
+# -----------------------------------------------------------------------------
+def build_html_report(error_count, current_errors, recent_stats, cumulative_stats):
+    """
+    이메일 본문(HTML)을 생성합니다.
+    """
+    recent_spans, recent_types = recent_stats
+    # cumulative_stats는 그래프 생성에 사용되므로 여기서는 직접 출력하지 않거나 
+    # 그래프 제목으로 구분함.
+
+    # 1. 현재 메일 오타 리스트 HTML
+    current_error_rows = ""
+    for w, c in current_errors:
+        current_error_rows += f"<li>❌ <b>{w}</b> → ⭕ {c}</li>"
+
+    # 2. [리스트] 최근 20건 통계 HTML
+    stats_rows = ""
+    if recent_spans:
+        for idx, (word, cnt) in enumerate(recent_spans, 1):
+            stats_rows += f"""
+            <tr>
+                <td style="padding:5px; border-bottom:1px solid #eee;">{idx}</td>
+                <td style="padding:5px; border-bottom:1px solid #eee; font-weight:bold;">{word}</td>
+                <td style="padding:5px; border-bottom:1px solid #eee; text-align:center;">{cnt}회</td>
+            </tr>
+            """
+    else:
+        stats_rows = "<tr><td colspan='3'>데이터가 부족합니다.</td></tr>"
+
+    html_content = f"""
+    <div style="font-family:'Malgun Gothic', AppleSDGothicNeo, sans-serif; color:#333; max-width:600px; line-height:1.6;">
+        <h2 style="color:#d63031;">🚫 메일 발송이 차단되었습니다.</h2>
+        <p>작성하신 메일에서 <b>{error_count}건</b>의 오타가 감지되었습니다.</p>
+        
+        <div style="background-color:#fff5f5; padding:15px; border-radius:10px; border:1px solid #ffcccc;">
+            <h3 style="margin-top:0;">🔍 메일 교정 제안</h3>
+            <ul>{current_error_rows}</ul>
+        </div>
+
+        <br>
+        <hr style="border:0; border-top:2px solid #eee;">
+        
+        <h3>📊 최근 오타 데이터 리포트</h3>
+        <p style="font-size:12px; color:#666;">* 가장 최근 수집된 메일 로그 20건에서 자주 발생한 오타입니다.</p>
+        
+        <table style="width:100%; border-collapse:collapse; margin-bottom:20px;">
+            <tr style="background-color:#f1f2f6;">
+                <th style="padding:8px; text-align:left;">순위</th>
+                <th style="padding:8px; text-align:left;">자주 틀린 표현</th>
+                <th style="padding:8px; text-align:center;">횟수</th>
+            </tr>
+            {stats_rows}
+        </table>
+
+        <br>
+        <h3>📈 전체 누적 데이터 그래프</h3>
+        <p style="font-size:12px; color:#666;">* 사내에 축적된 <b>전체 데이터</b>를 기반으로 한 통계입니다.</p>
+        <div style="display:flex; gap:10px;">
+            <div style="flex:1;">
+                <h4 style="text-align:center;">누적 Top 5 오타 단어</h4>
+                <img src="cid:chart_spans" style="width:100%; border-radius:8px; border:1px solid #eee;">
+            </div>
+            <div style="flex:1;">
+                <h4 style="text-align:center;">누적 Top 5 에러 유형</h4>
+                <img src="cid:chart_types" style="width:100%; border-radius:8px; border:1px solid #eee;">
+            </div>
+        </div>
+    </div>
+    """
+    return html_content
+
+# -----------------------------------------------------------------------------
+# 6. 이메일 전송 함수
+# -----------------------------------------------------------------------------
+def send_report_email(receiver, subject, html_body, images):
+    msg = MIMEMultipart("related")
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = receiver
+    msg["Subject"] = subject
+
+    # HTML 본문
+    msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
+
+    # 이미지 첨부
+    for img_data in images:
+        img = MIMEImage(img_data['bytes'], _subtype="png")
+        img.add_header('Content-ID', f"<{img_data['cid']}>")
+        msg.attach(img)
+
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, APP_PASSWORD)
+        server.sendmail(SENDER_EMAIL, receiver, msg.as_string())
+        server.quit()
+        return True
+    except Exception as e:
+        print(f"이메일 전송 실패: {e}")
+        return False
+
+# -----------------------------------------------------------------------------
+# 7. 메일(Main)
+# -----------------------------------------------------------------------------
+def check_spelling(text):
+    found_details = []
+    
+    # 비상용 내부 사전
+    fallback_dict = {
+        "역활": "역할", "봽겠습니다": "뵙겠습니다", "결제": "결재",
+        "어떻해": "어떡해", "되요": "돼요", "로써": "로서", "화신": "회신"
+    }
+    for wrong, correct in fallback_dict.items():
+        if wrong in text:
+            found_details.append((wrong, correct))
+
+    # Hanspell 검사
+    try:
+        spelled = spell_checker.check(text)
+        for key, value in spelled.words.items():
+            if value == 2 and key not in [x[0] for x in found_details]:
+                found_details.append((key, "(맞춤법 오류)"))
+    except:
+        pass
+    
+    return len(found_details), found_details
+
+def process_email(receiver, subject, body):
+    # 오타 검사
+    error_count, error_details = check_spelling(body)
+    
+    # DB 기록
+    typos_str = ", ".join([f"{w}->{c}" for w, c in error_details])
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO mail_logs (body, typos, is_correct_feedback, timestamp) VALUES (?, ?, ?, ?)",
+              (body, typos_str, 0, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    last_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    if error_count == 0:
+        # 정상 발송
+        sender_email = SENDER_EMAIL
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = receiver
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        try:
+            s = smtplib.SMTP('smtp.gmail.com', 587)
+            s.starttls()
+            s.login(sender_email, APP_PASSWORD)
+            s.sendmail(sender_email, receiver, msg.as_string())
+            s.quit()
+            gr.Info("✅ 발송 성공")
+            return last_id, gr.update(visible=False)
+        except:
+            gr.Warning("❌ 발송 실패")
+            return last_id, gr.update(visible=False)
+    else:
+        # 🚫 차단 및 리포트 발송
+        gr.Warning(f"🚫 오타 {error_count}건 감지! 분석 리포트가 발송됩니다.")
+
+        # 데이터 가져오기 (최근20건 / 누적)
+        recent_stats, cumulative_stats = get_data_analysis()
+        
+        # 언패킹
+        cum_spans, cum_types = cumulative_stats
+
+        # 그래프 생성 -> [중요] '누적 데이터(cumulative_stats)' 사용
+        img_spans = make_bar_png(cum_spans, "누적 자주 틀린 표현 Top 5", color='#ff7675')
+        img_types = make_bar_png(cum_types, "누적 오타 유형 분포 Top 5", color='#74b9ff')
+
+        # HTML 생성 -> [중요] 리스트는 '최근 데이터(recent_stats)' 사용
+        html_body = build_html_report(error_count, error_details, recent_stats, cumulative_stats)
+
+        # 이미지 패키징
+        images = [
+            {'cid': 'chart_spans', 'bytes': img_spans},
+            {'cid': 'chart_types', 'bytes': img_types}
+        ]
+
+        # 리포트 메일 발송
+        send_report_email(SENDER_EMAIL, f"[경고] 메일 발송 차단 (오타 {error_count}건)", html_body, images)
+        
+        return last_id, gr.update(visible=True)
+
+def submit_feedback(row_id, feedback_val):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    val = 1 if feedback_val == "네, 오타가 맞습니다" else 0
+    c.execute("UPDATE mail_logs SET is_correct_feedback = ? WHERE id = ?", (val, row_id))
+    conn.commit()
+    conn.close()
+    gr.Info("피드백이 반영되었습니다.")
+    return "반영 완료"
+
+# -----------------------------------------------------------------------------
+# 8. UI 실행
+# -----------------------------------------------------------------------------
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("## 📧 스마트 메일 시스템")
+    
+    with gr.Row():
+        with gr.Column(scale=2):
+            receiver_input = gr.Textbox(label="수신자 이메일")
+            subject_input = gr.Textbox(label="제목")
+            content_input = gr.TextArea(label="본문 내용", lines=12, placeholder="내용을 입력하세요...")
+            send_btn = gr.Button("메일 보내기", variant="primary")
+        
+        with gr.Column(scale=1):
+            current_log_id = gr.State()
+            with gr.Group(visible=False) as feedback_area:
+                gr.Markdown("### 🧐 검증 피드백")
+                feedback_radio = gr.Radio(["네, 오타가 맞습니다", "아니요"], label="판단")
+                feedback_btn = gr.Button("제출")
+                feedback_msg = gr.Markdown("")
+
+    send_btn.click(fn=process_email, inputs=[receiver_input, subject_input, content_input], outputs=[current_log_id, feedback_area])
+    feedback_btn.click(fn=submit_feedback, inputs=[current_log_id, feedback_radio], outputs=feedback_msg)
+
+demo.launch(share=True)
